@@ -1,0 +1,17 @@
+name: enterprise-rag-copilot
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - streamlit==1.52.2
+      - chromadb==1.4.0
+      - langchain
+      - langchain-core
+      - langchain-community
+      - langchain-openai
+      - langchain-text-splitters
+      - pypdf
+      - tiktoken
+      - python-dotenv
