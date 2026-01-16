@@ -1,18 +1,20 @@
 import os
-import shutil
-from typing import List
+import time
+from typing import List, Optional
 
 import streamlit as st
 from dotenv import load_dotenv
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma  # no deprecation warning
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+
+import chromadb
 
 
 # ----------------------------
@@ -21,13 +23,37 @@ from langchain_core.output_parsers import StrOutputParser
 load_dotenv()
 
 # ----------------------------
+# API key guard (local .env + Streamlit Cloud)
+# ----------------------------
+api_key = os.getenv("OPENAI_API_KEY")
+
+if not api_key:
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY", None)
+        if api_key:
+            os.environ["OPENAI_API_KEY"] = api_key
+    except Exception:
+        pass
+
+if not api_key:
+    st.error(
+        "OPENAI_API_KEY not found.\n\n"
+        "✅ Local: create a .env file in your project root with:\n"
+        "OPENAI_API_KEY=sk-...\n\n"
+        "✅ Streamlit Cloud: set Secrets with:\n"
+        "OPENAI_API_KEY = \"sk-...\""
+    )
+    st.stop()
+
+
+# ----------------------------
 # Paths
 # ----------------------------
 BASE_DIR = os.getcwd()
 DATA_DIR = os.path.join(BASE_DIR, "data")
-CHROMA_DIR = os.path.join(BASE_DIR, "chroma_db")
+CHROMA_DIR_BASE = os.path.join(BASE_DIR, "chroma_db")  # base prefix; versioned per rebuild
+COLLECTION_NAME = "enterprise_kb"
 
-# Ensure data dir exists early (before uploads)
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # ----------------------------
@@ -35,7 +61,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # ----------------------------
 st.set_page_config(page_title="Enterprise Knowledge Copilot", layout="wide")
 st.title("🏢 Enterprise Knowledge Copilot")
-st.caption("Upload enterprise documents, build an index, then ask questions with sources.")
+st.caption("Upload enterprise documents, build an index, then chat with your knowledge base (with sources).")
 
 # ----------------------------
 # Init LLM + Embeddings
@@ -43,11 +69,25 @@ st.caption("Upload enterprise documents, build an index, then ask questions with
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 embeddings = OpenAIEmbeddings()
 
+
+# ----------------------------
+# Session helpers (Windows-safe indexing)
+# ----------------------------
+def get_active_chroma_dir() -> str:
+    if "chroma_dir" not in st.session_state:
+        st.session_state.chroma_dir = CHROMA_DIR_BASE
+    return st.session_state.chroma_dir
+
+
+def new_chroma_dir() -> str:
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    return f"{CHROMA_DIR_BASE}_{ts}"
+
+
 # ----------------------------
 # Document Loading
 # ----------------------------
 def load_documents_from_data_dir() -> List[Document]:
-    """Load all supported files from DATA_DIR into LangChain Documents."""
     documents: List[Document] = []
 
     for filename in os.listdir(DATA_DIR):
@@ -63,21 +103,33 @@ def load_documents_from_data_dir() -> List[Document]:
 
     return documents
 
+
 # ----------------------------
 # Chunking
 # ----------------------------
 def split_documents(documents: List[Document]) -> List[Document]:
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    return splitter.split_documents(documents)
+    chunks = splitter.split_documents(documents)
+
+    # Normalize metadata a bit (nice for UI + debugging)
+    for d in chunks:
+        d.metadata = d.metadata or {}
+        d.metadata["source"] = d.metadata.get("source", "unknown")
+        if "page" in d.metadata:
+            # PyPDFLoader uses 0-index pages typically
+            d.metadata["page"] = int(d.metadata["page"])
+    return chunks
+
 
 # ----------------------------
 # Vector DB (Build / Load)
 # ----------------------------
 def build_vectorstore() -> Chroma:
-    """(Re)build the Chroma index from docs in DATA_DIR."""
-    # Delete old DB if exists
-    if os.path.exists(CHROMA_DIR):
-        shutil.rmtree(CHROMA_DIR)
+    """
+    Build Chroma index into a NEW directory each time (Windows-safe).
+    Uses chromadb.PersistentClient so persistence is handled by Chroma itself.
+    """
+    target_dir = new_chroma_dir()
 
     docs = load_documents_from_data_dir()
     if not docs:
@@ -85,25 +137,39 @@ def build_vectorstore() -> Chroma:
 
     chunks = split_documents(docs)
 
-    vectordb = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        persist_directory=CHROMA_DIR,
-    )
-    vectordb.persist()
-    return vectordb
+    # Persistent client (recommended)
+    client = chromadb.PersistentClient(path=target_dir)
 
-def load_vectorstore() -> Chroma | None:
-    """Load existing Chroma index if present."""
-    if not os.path.exists(CHROMA_DIR):
-        return None
-    return Chroma(
-        persist_directory=CHROMA_DIR,
+    # Create / get collection + wrap with LangChain
+    vectordb = Chroma(
+        client=client,
+        collection_name=COLLECTION_NAME,
         embedding_function=embeddings,
     )
 
+    # Add documents (this persists automatically with PersistentClient)
+    vectordb.add_documents(chunks)
+
+    # Track active directory in session
+    st.session_state.chroma_dir = target_dir
+    return vectordb
+
+
+def load_vectorstore() -> Optional[Chroma]:
+    active_dir = get_active_chroma_dir()
+    if not os.path.exists(active_dir):
+        return None
+
+    client = chromadb.PersistentClient(path=active_dir)
+    return Chroma(
+        client=client,
+        collection_name=COLLECTION_NAME,
+        embedding_function=embeddings,
+    )
+
+
 # ----------------------------
-# Prompt & Chains
+# Prompt & Retrieval / Answer
 # ----------------------------
 PROMPT = ChatPromptTemplate.from_template(
     """
@@ -122,6 +188,7 @@ Question:
 """
 )
 
+
 def retrieve_docs(query: str) -> List[Document]:
     vectordb = load_vectorstore()
     if vectordb is None:
@@ -133,16 +200,23 @@ def retrieve_docs(query: str) -> List[Document]:
     )
     return retriever.invoke(query)
 
+
 def answer_question(question: str, docs: List[Document]) -> str:
     if not docs:
         return "I don't know. I couldn't find relevant context in the indexed documents."
 
     context = "\n\n".join(
-        [f"Source: {d.metadata.get('source', '')}\n{d.page_content}" for d in docs]
+        [
+            f"Source: {d.metadata.get('source', '')}"
+            + (f" | Page: {d.metadata.get('page')}" if d.metadata.get("page") is not None else "")
+            + f"\n{d.page_content}"
+            for d in docs
+        ]
     )
 
     chain = PROMPT | llm | StrOutputParser()
     return chain.invoke({"context": context, "question": question})
+
 
 # ----------------------------
 # Sidebar: Upload + Index
@@ -167,32 +241,84 @@ if st.sidebar.button("🔄 Build / Rebuild Index"):
         with st.spinner("Indexing documents..."):
             build_vectorstore()
         st.sidebar.success("✅ Index built successfully!")
+        st.rerun()
     except Exception as e:
         st.sidebar.error(f"❌ Failed to build index: {e}")
 
+st.sidebar.divider()
+
+active_dir = get_active_chroma_dir()
+st.sidebar.caption("Active index directory:")
+st.sidebar.code(active_dir)
+
+if st.sidebar.button("🧹 Clear Chat"):
+    st.session_state.messages = []
+    st.rerun()
+
+
 # ----------------------------
-# Main UI: Ask Questions
+# Require index before chat
 # ----------------------------
 vectordb = load_vectorstore()
 if vectordb is None:
-    st.info("Upload documents and build the index to start asking questions.")
+    st.info("Upload documents and build the index to start chatting.")
     st.stop()
 
-question = st.text_input("Ask your enterprise question:")
 
-if question.strip():
-    with st.spinner("Retrieving and generating answer..."):
-        docs = retrieve_docs(question)
-        answer = answer_question(question, docs)
+# ----------------------------
+# Chat state
+# ----------------------------
+if "messages" not in st.session_state:
+    st.session_state.messages = [
+        {"role": "assistant", "content": "Hi! Ask me anything about the documents you uploaded."}
+    ]
 
-    st.subheader("✅ Answer")
-    st.write(answer)
+# Render chat history
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.write(msg["content"])
+        if msg["role"] == "assistant" and msg.get("sources"):
+            with st.expander("📚 Sources"):
+                for i, src in enumerate(msg["sources"], start=1):
+                    st.markdown(f"**Source {i}: {src['source']}**")
+                    if src.get("page") is not None:
+                        st.caption(f"Page: {src['page']}")
+                    st.write(src["content"])
+                    st.divider()
 
-    st.subheader("📚 Sources")
-    if not docs:
-        st.info("No sources found for this question.")
-    else:
-        for i, doc in enumerate(docs, start=1):
-            src = doc.metadata.get("source", "unknown")
-            with st.expander(f"Source {i}: {src}"):
-                st.write(doc.page_content)
+# Chat input
+user_input = st.chat_input("Ask your enterprise question...")
+
+if user_input:
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.write(user_input)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Retrieving and generating answer..."):
+            docs = retrieve_docs(user_input)
+            answer = answer_question(user_input, docs)
+
+        st.write(answer)
+
+        sources_payload = [
+            {
+                "source": d.metadata.get("source", "unknown"),
+                "page": d.metadata.get("page"),
+                "content": d.page_content,
+            }
+            for d in docs
+        ]
+
+        if sources_payload:
+            with st.expander("📚 Sources"):
+                for i, s in enumerate(sources_payload, start=1):
+                    st.markdown(f"**Source {i}: {s['source']}**")
+                    if s.get("page") is not None:
+                        st.caption(f"Page: {s['page']}")
+                    st.write(s["content"])
+                    st.divider()
+
+    st.session_state.messages.append(
+        {"role": "assistant", "content": answer, "sources": sources_payload}
+    )
