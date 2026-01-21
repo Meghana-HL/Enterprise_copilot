@@ -1,0 +1,13 @@
+Team Tasks
+
+Engineering:
+- Fix login bug
+- Add calendar feature
+
+Design:
+- Update logo
+- Improve homepage
+
+Marketing:
+- Write blog post
+- Create Instagram posts

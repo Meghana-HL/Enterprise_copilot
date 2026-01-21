@@ -1,0 +1,4 @@
+Company Name: BrightTech
+What we do: We build simple productivity apps for small teams.
+Teams: Engineering, Design, Marketing
+Office Hours: 9 AM to 5 PM

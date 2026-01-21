@@ -1,0 +1,6 @@
+Customer Feedback
+
+- The app is easy to use.
+- Login is sometimes slow.
+- Calendar feature is very useful.
+- Dark mode is requested.
